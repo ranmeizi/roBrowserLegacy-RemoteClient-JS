@@ -7,6 +7,11 @@ const logger = require('../utils/logger');
 const iconv = require('iconv-lite');
 const { isLooseFilesMode } = require('../utils/looseFilesMode');
 const {
+  startLooseFileIndex,
+  getLooseIndexStats,
+  isLooseIndexComplete,
+} = require('../utils/looseFileIndex');
+const {
   LOOSE_PATH_RESOLVER_VERSION,
   decodeMojibake,
   encodeMojibake,
@@ -16,17 +21,41 @@ const {
   joinRootWithLatin1Path,
   resolveLooseFilePath,
   findLooseFileByName,
-  getKoreanPathVariants,
 } = require('../utils/pathEncoding');
 
+// Resolved request path → on-disk path (base64 buffer), avoids repeat readdir walks
+const loosePathCache = new Map();
+const LOOSE_PATH_CACHE_MAX = 50000;
+
+function getLoosePathCacheKey(filePath) {
+  return filePath.toLowerCase().replace(/\\/g, '/');
+}
+
+function getCachedDiskPath(filePath) {
+  const hit = loosePathCache.get(getLoosePathCacheKey(filePath));
+  if (!hit) {
+    return null;
+  }
+  return Buffer.from(hit, 'base64');
+}
+
+function setCachedDiskPath(filePath, diskPath) {
+  if (loosePathCache.size >= LOOSE_PATH_CACHE_MAX) {
+    loosePathCache.clear();
+  }
+  const buf = Buffer.isBuffer(diskPath) ? diskPath : Buffer.from(diskPath);
+  loosePathCache.set(getLoosePathCacheKey(filePath), buf.toString('base64'));
+}
+
 function tryReadFileAt(fullPath, cacheKey) {
-  if (!fs.existsSync(fullPath)) return null;
   try {
     const content = fs.readFileSync(fullPath);
     fileCache.set(cacheKey, content);
     return content;
   } catch (e) {
-    logger.error(`Error reading local file ${fullPath}: ${e.message}`);
+    if (e.code !== 'ENOENT') {
+      logger.error(`Error reading local file: ${e.message}`);
+    }
     return null;
   }
 }
@@ -35,9 +64,17 @@ function tryReadFileAt(fullPath, cacheKey) {
  * Resolve loose (unpacked) client files, including mojibake Korean path variants.
  */
 function tryReadLooseFile(projectRoot, filePath, cacheKey) {
+  const cachedDiskPath = getCachedDiskPath(filePath);
+  if (cachedDiskPath) {
+    const content = tryReadFileAt(cachedDiskPath, cacheKey);
+    if (content) {
+      return content;
+    }
+    loosePathCache.delete(getLoosePathCacheKey(filePath));
+  }
+
   const filenameEncoding = getLooseFilenameEncoding();
-  const variants = getFilePathVariants(filePath, pathMapping);
-  const koreanVariants = getKoreanPathVariants(filePath, pathMapping);
+  const hasNonAscii = /[가-힣\u0080-\u00ff]/.test(filePath);
   const roots = [{ base: projectRoot, stripDataPrefix: false }];
 
   if (process.env.LOOSE_FILES_ROOT) {
@@ -54,30 +91,53 @@ function tryReadLooseFile(projectRoot, filePath, cacheKey) {
     });
   }
 
-  // Walk directories: match Unicode HTTP URLs to CP949 / mojibake on-disk names
-  for (const { base, stripDataPrefix } of roots) {
-    const resolved = resolveLooseFilePath(base, filePath, filenameEncoding, stripDataPrefix);
-    if (resolved) {
-      const content = tryReadFileAt(resolved, cacheKey);
+  const tryDiskPath = diskPath => {
+    const content = tryReadFileAt(diskPath, cacheKey);
+    if (content) {
+      setCachedDiskPath(filePath, diskPath);
+      return content;
+    }
+    return null;
+  };
+
+  // ASCII paths: single open(), no encoding work
+  if (!hasNonAscii) {
+    for (const { base, stripDataPrefix } of roots) {
+      let rel = filePath.replace(/\\/g, '/');
+      if (stripDataPrefix) {
+        rel = rel.replace(/^data[\/\\]/i, '');
+      }
+      const content = tryDiskPath(path.join(base, rel));
+      if (content) {
+        return content;
+      }
+    }
+    return null;
+  }
+
+  // Korean Unicode URL → CP949 bytes on disk (1 syscall, no readdir)
+  if (filenameEncoding !== 'utf-8' && filenameEncoding !== 'utf8') {
+    for (const { base, stripDataPrefix } of roots) {
+      const bufPath = joinRootWithEncodedPath(base, filePath, filenameEncoding, stripDataPrefix);
+      const content = tryDiskPath(bufPath);
       if (content) {
         return content;
       }
     }
   }
 
-  // CP949 byte paths (Korean Windows client copied to Linux — names are not UTF-8)
-  if (filenameEncoding !== 'utf-8' && filenameEncoding !== 'utf8') {
-    for (const variant of koreanVariants) {
-      for (const { base, stripDataPrefix } of roots) {
-        const bufPath = joinRootWithEncodedPath(base, variant, filenameEncoding, stripDataPrefix);
-        const content = tryReadFileAt(bufPath, cacheKey);
-        if (content) {
-          return content;
-        }
+  // Fallback: cached readdir walk for unusual encodings
+  for (const { base, stripDataPrefix } of roots) {
+    const resolved = resolveLooseFilePath(base, filePath, filenameEncoding, stripDataPrefix);
+    if (resolved) {
+      const content = tryDiskPath(resolved);
+      if (content) {
+        return content;
       }
     }
   }
 
+  const variants = getFilePathVariants(filePath, pathMapping);
   for (const variant of variants) {
     for (const { base, stripDataPrefix } of roots) {
       let rel = variant;
@@ -86,14 +146,13 @@ function tryReadLooseFile(projectRoot, filePath, cacheKey) {
       }
 
       if (/[\u0080-\u00ff]/.test(rel) && !/[가-힣]/.test(rel)) {
-        const latinPath = joinRootWithLatin1Path(base, rel, stripDataPrefix);
-        const latinContent = tryReadFileAt(latinPath, cacheKey);
+        const latinContent = tryDiskPath(joinRootWithLatin1Path(base, rel, stripDataPrefix));
         if (latinContent) {
           return latinContent;
         }
       }
 
-      const content = tryReadFileAt(path.join(base, rel), cacheKey);
+      const content = tryDiskPath(path.join(base, rel));
       if (content) {
         return content;
       }
@@ -173,10 +232,26 @@ const Client = {
     // Check if data section exists and has GRF files configured
     if (!dataIni.data || dataIni.data.length === 0) {
       if (isLooseFilesMode()) {
-        logger.info(
-          'Loose files mode: on-demand path lookup with CP949/Unicode aliases (no full data/ index)'
-        );
         this.grfs = [];
+        const projectRoot = path.join(__dirname, '..', '..');
+        const indexEnabled = process.env.LOOSE_INDEX !== 'false';
+
+        if (indexEnabled) {
+          logger.info(
+            'Loose files mode: async file index for search (data/ root first, then full tree)'
+          );
+          startLooseFileIndex(projectRoot, fileIndex, elapsed => {
+            indexBuilt = true;
+            const stats = getLooseIndexStats();
+            logger.info(
+              `Loose file index ready: ${stats.filesIndexed.toLocaleString()} files (${elapsed}ms)`
+            );
+          });
+        } else {
+          logger.info(
+            'Loose files mode: on-demand path lookup (LOOSE_INDEX=false, search disabled until indexed)'
+          );
+        }
         return;
       }
       logger.warn('No GRF files configured in DATA.INI. Add GRF files to [data] section.');
@@ -449,32 +524,40 @@ const Client = {
   },
 
   getIndexStats() {
+    const looseIndex = getLooseIndexStats();
+    const uniquePaths = new Set();
+    for (const [, entry] of fileIndex) {
+      uniquePaths.add(entry.originalPath);
+    }
+
     return {
       totalFiles: fileIndex.size,
+      uniqueFiles: uniquePaths.size,
       grfCount: this.grfs.length,
-      indexBuilt,
+      indexBuilt: indexBuilt || isLooseIndexComplete(),
+      looseIndex,
     };
   },
 
   listFiles() {
-    // Use index if available for faster response
-    if (indexBuilt) {
-      const uniqueFiles = new Set();
-      for (const [, entry] of fileIndex) {
-        uniqueFiles.add(entry.originalPath);
-      }
+    const uniqueFiles = new Set();
+
+    for (const [, entry] of fileIndex) {
+      uniqueFiles.add(entry.originalPath);
+    }
+
+    if (uniqueFiles.size > 0 || indexBuilt || isLooseIndexComplete()) {
       return Array.from(uniqueFiles);
     }
 
-    // Fallback to GRF iteration
-    const allFiles = new Set();
     for (const grf of this.grfs) {
       if (grf && grf.listFiles) {
         const files = grf.listFiles();
-        files.forEach(file => allFiles.add(file));
+        files.forEach(file => uniqueFiles.add(file));
       }
     }
-    return Array.from(allFiles);
+
+    return Array.from(uniqueFiles);
   },
 
   search(regex) {
@@ -485,17 +568,16 @@ const Client = {
 
     const matchingFiles = new Set();
 
-    // Use index for faster search
-    if (indexBuilt) {
-      for (const [, entry] of fileIndex) {
-        if (regex.test(entry.originalPath)) {
-          matchingFiles.add(entry.originalPath);
-        }
+    for (const [, entry] of fileIndex) {
+      if (regex.test(entry.originalPath)) {
+        matchingFiles.add(entry.originalPath);
       }
+    }
+
+    if (matchingFiles.size > 0 || fileIndex.size > 0 || indexBuilt || isLooseIndexComplete()) {
       return Array.from(matchingFiles);
     }
 
-    // Fallback
     for (const grf of this.grfs) {
       if (grf && grf.listFiles) {
         const files = grf.listFiles();

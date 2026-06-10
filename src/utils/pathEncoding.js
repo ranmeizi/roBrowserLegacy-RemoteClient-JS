@@ -2,6 +2,47 @@ const fs = require('fs');
 const path = require('path');
 const iconv = require('iconv-lite');
 
+// Cache readdir + per-folder segment resolution (loose client dirs rarely change at runtime)
+const dirListingCache = new Map();
+const segmentResolveCache = new Map();
+const DIR_CACHE_MAX = 2000;
+const SEGMENT_CACHE_MAX = 20000;
+
+function dirCacheKey(dirBuf) {
+  return dirBuf.toString('base64');
+}
+
+function readDirCached(dirBuf) {
+  const key = dirCacheKey(dirBuf);
+  if (dirListingCache.has(key)) {
+    return dirListingCache.get(key);
+  }
+
+  let rawEntries;
+  try {
+    rawEntries = fs.readdirSync(dirBuf, { encoding: 'buffer', withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  const entries = rawEntries.map(entry => {
+    const nameBuf = Buffer.isBuffer(entry.name) ? entry.name : Buffer.from(String(entry.name));
+    let entryType = null;
+    if (typeof entry.isDirectory === 'function' && entry.isDirectory()) {
+      entryType = 'dir';
+    } else if (typeof entry.isFile === 'function' && entry.isFile()) {
+      entryType = 'file';
+    }
+    return { nameBuf, entryType };
+  });
+
+  if (dirListingCache.size >= DIR_CACHE_MAX) {
+    dirListingCache.clear();
+  }
+  dirListingCache.set(key, entries);
+  return entries;
+}
+
 /**
  * Filename encoding on disk for unpacked Korean RO clients (Windows CP949).
  * Set LOOSE_FILENAME_ENCODING=utf-8 if files were converted to UTF-8 names.
@@ -192,7 +233,11 @@ function bytesMatchSegment(nameBuf, segment, filenameEncoding) {
   return false;
 }
 
-function getBufferEntryType(parentBuf, nameBuf) {
+function getBufferEntryType(parentBuf, nameBuf, hintedType = null) {
+  if (hintedType) {
+    return hintedType;
+  }
+
   const fullPath = Buffer.concat([parentBuf, Buffer.from([0x2f]), nameBuf]);
   try {
     const stat = fs.statSync(fullPath);
@@ -245,22 +290,32 @@ function resolveLooseFilePath(
     const isFile = i === parts.length - 1;
     const targetKeys = getSegmentMatchKeys(targetSeg);
 
-    let entries;
-    try {
-      entries = fs.readdirSync(dirBuf, { encoding: 'buffer', withFileTypes: true });
-    } catch {
+    const segmentCacheKey = `${dirCacheKey(dirBuf)}|${targetSeg.toLowerCase()}`;
+    if (segmentResolveCache.has(segmentCacheKey)) {
+      const cachedName = segmentResolveCache.get(segmentCacheKey);
+      if (cachedName) {
+        dirBuf = Buffer.concat([dirBuf, Buffer.from([0x2f]), cachedName]);
+        continue;
+      }
+      if (!diagnose) {
+        return null;
+      }
+    }
+
+    const entries = readDirCached(dirBuf);
+    if (!entries) {
       return null;
     }
 
     let matchedName = null;
     for (const entry of entries) {
-      const nameBuf = Buffer.isBuffer(entry.name) ? entry.name : Buffer.from(String(entry.name));
+      const { nameBuf, entryType: hintedType } = entry;
       const rawLatin = nameBuf.toString('latin1');
       if (rawLatin.startsWith('add-')) {
         continue;
       }
 
-      const entryType = getBufferEntryType(dirBuf, nameBuf);
+      const entryType = getBufferEntryType(dirBuf, nameBuf, hintedType);
       if (isFile && entryType !== 'file') {
         continue;
       }
@@ -274,6 +329,11 @@ function resolveLooseFilePath(
         break;
       }
     }
+
+    if (segmentResolveCache.size >= SEGMENT_CACHE_MAX) {
+      segmentResolveCache.clear();
+    }
+    segmentResolveCache.set(segmentCacheKey, matchedName);
 
     if (!matchedName) {
       if (!diagnose) {
@@ -448,10 +508,11 @@ function getFilePathVariants(filePath, pathMapping) {
 }
 
 module.exports = {
-  LOOSE_PATH_RESOLVER_VERSION: 3,
+  LOOSE_PATH_RESOLVER_VERSION: 4,
   getLooseFilenameEncoding,
   decodeBufferFilename,
   decodeFilesystemName,
+  readDirCached,
   joinRootWithEncodedPath,
   joinRootWithLatin1Path,
   resolveLooseFilePath,
