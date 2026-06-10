@@ -6,19 +6,57 @@ const LRUCache = require('../utils/LRUCache');
 const logger = require('../utils/logger');
 const iconv = require('iconv-lite');
 const { isLooseFilesMode } = require('../utils/looseFilesMode');
+const {
+  decodeMojibake,
+  encodeMojibake,
+  getFilePathVariants,
+} = require('../utils/pathEncoding');
+
+function tryReadFileAt(fullPath, cacheKey) {
+  if (!fs.existsSync(fullPath)) return null;
+  try {
+    const content = fs.readFileSync(fullPath);
+    fileCache.set(cacheKey, content);
+    return content;
+  } catch (e) {
+    logger.error(`Error reading local file ${fullPath}: ${e.message}`);
+    return null;
+  }
+}
 
 /**
- * Convert mojibake (CP949 bytes interpreted as Latin-1) back to proper Korean Unicode.
- * roBrowser sends paths like "À¯ÀúÀÎÅÍÆäÀÌ½º" which is CP949 bytes of "유저인터페이스"
- * read as ISO-8859-1. We reverse this by encoding as Latin-1 then decoding as CP949.
+ * Resolve loose (unpacked) client files, including mojibake Korean path variants.
  */
-function decodeMojibake(str) {
-  try {
-    const latin1Buf = iconv.encode(str, 'iso-8859-1');
-    return iconv.decode(latin1Buf, 'cp949');
-  } catch (e) {
-    return str;
+function tryReadLooseFile(projectRoot, filePath, cacheKey) {
+  const variants = getFilePathVariants(filePath, pathMapping);
+  const roots = [{ base: projectRoot, stripDataPrefix: false }];
+
+  if (process.env.LOOSE_FILES_ROOT) {
+    roots.push({
+      base: path.resolve(projectRoot, process.env.LOOSE_FILES_ROOT),
+      stripDataPrefix: false,
+    });
   }
+
+  if (process.env.DATA_OVERRIDE_PATH) {
+    roots.push({
+      base: path.resolve(projectRoot, process.env.DATA_OVERRIDE_PATH),
+      stripDataPrefix: true,
+    });
+  }
+
+  for (const variant of variants) {
+    for (const { base, stripDataPrefix } of roots) {
+      let rel = variant;
+      if (stripDataPrefix) {
+        rel = rel.replace(/^data[\/\\]/i, '');
+      }
+      const content = tryReadFileAt(path.join(base, rel), cacheKey);
+      if (content) return content;
+    }
+  }
+
+  return null;
 }
 
 // File content cache (5000 files, 1024MB max)
@@ -93,6 +131,7 @@ const Client = {
       if (isLooseFilesMode()) {
         logger.info('Loose files mode: serving assets from local directories (data/, BGM/, System/)');
         this.grfs = [];
+        this.buildLooseFileIndex(path.join(__dirname, '..', '..'));
         return;
       }
       logger.warn('No GRF files configured in DATA.INI. Add GRF files to [data] section.');
@@ -191,6 +230,77 @@ const Client = {
   },
 
   /**
+   * Index unpacked client files for O(1) lookup (Unicode + mojibake path aliases).
+   */
+  buildLooseFileIndex(projectRoot) {
+    const startTime = Date.now();
+    fileIndex.clear();
+    let fileCount = 0;
+
+    const indexLoosePath = (relPath, diskPath) => {
+      const addKey = (key) => {
+        const normalized = key.toLowerCase().replace(/\\/g, '/');
+        const entry = { loose: true, diskPath, originalPath: relPath };
+        if (!fileIndex.has(normalized)) {
+          fileIndex.set(normalized, entry);
+        }
+        const backslash = key.toLowerCase().replace(/\//g, '\\');
+        if (!fileIndex.has(backslash)) {
+          fileIndex.set(backslash, entry);
+        }
+      };
+
+      addKey(relPath);
+      const mojibakePath = encodeMojibake(relPath);
+      if (mojibakePath !== relPath) {
+        addKey(mojibakePath);
+      }
+    };
+
+    const walkDir = (baseDir, relPrefix, onlySubdirs = null) => {
+      if (onlySubdirs) {
+        for (const sub of onlySubdirs) {
+          walkDir(path.join(baseDir, sub), sub);
+        }
+        return;
+      }
+
+      if (!fs.existsSync(baseDir)) return;
+      for (const entry of fs.readdirSync(baseDir, { withFileTypes: true })) {
+        if (entry.name.startsWith('add-')) continue;
+        const full = path.join(baseDir, entry.name);
+        const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          walkDir(full, rel);
+        } else if (entry.isFile()) {
+          indexLoosePath(rel.replace(/\\/g, '/'), full);
+          fileCount += 1;
+        }
+      }
+    };
+
+    const assetDirs = ['data', 'BGM', 'System'];
+
+    walkDir(projectRoot, null, assetDirs);
+
+    if (process.env.LOOSE_FILES_ROOT) {
+      const looseRoot = path.resolve(projectRoot, process.env.LOOSE_FILES_ROOT);
+      walkDir(looseRoot, null, assetDirs);
+    }
+
+    if (process.env.DATA_OVERRIDE_PATH) {
+      const overrideRoot = path.resolve(projectRoot, process.env.DATA_OVERRIDE_PATH);
+      walkDir(overrideRoot, 'data');
+    }
+
+    indexBuilt = true;
+    const elapsed = Date.now() - startTime;
+    logger.info(
+      `Loose file index: ${fileCount.toLocaleString()} files, ${fileIndex.size.toLocaleString()} lookup keys (${elapsed}ms)`
+    );
+  },
+
+  /**
    * Get file with pre-computed ETag from cache
    * Returns { data, etag } or null
    */
@@ -210,49 +320,13 @@ const Client = {
     // Normalize paths
     let grfFilePath = filePath.replace(/\//g, '\\');
     const projectRoot = path.join(__dirname, '..', '..');
-    let localPath = path.join(projectRoot, filePath);
+    const localPath = path.join(projectRoot, filePath);
 
-    // Optional client root for fully unpacked clients outside project tree
-    if (process.env.LOOSE_FILES_ROOT) {
-      const loosePath = path.resolve(projectRoot, process.env.LOOSE_FILES_ROOT, filePath);
-      if (fs.existsSync(loosePath)) {
-        try {
-          const content = fs.readFileSync(loosePath);
-          fileCache.set(cacheKey, content);
-          return content;
-        } catch (e) {
-          logger.error(`Error reading loose root file: ${e.message}`);
-        }
-      }
-    }
+    // Loose files: try Unicode + mojibake path variants on disk
+    const looseContent = tryReadLooseFile(projectRoot, filePath, cacheKey);
+    if (looseContent) return looseContent;
 
-    // Check local file system first
-    if (fs.existsSync(localPath)) {
-      try {
-        const content = fs.readFileSync(localPath);
-        fileCache.set(cacheKey, content);
-        return content;
-      } catch (e) {
-        logger.error(`Error reading local file: ${e.message}`);
-      }
-    }
-
-    // Check DATA_OVERRIDE_PATH (external data dir with loose files not in GRF)
-    if (process.env.DATA_OVERRIDE_PATH) {
-      const relativePath = filePath.replace(/^data[\/\\]/, '');
-      const overridePath = path.resolve(__dirname, '..', '..', process.env.DATA_OVERRIDE_PATH, relativePath);
-      if (fs.existsSync(overridePath)) {
-        try {
-          const content = fs.readFileSync(overridePath);
-          fileCache.set(cacheKey, content);
-          return content;
-        } catch (e) {
-          logger.error(`Error reading override file: ${e.message}`);
-        }
-      }
-    }
-
-    // Use file index for O(1) GRF lookup
+    // Use file index for O(1) GRF / loose lookup
     const normalizedPath = filePath.toLowerCase().replace(/\\/g, '/');
     const normalizedBackslash = filePath.toLowerCase().replace(/\//g, '\\');
 
@@ -279,6 +353,11 @@ const Client = {
 
     // Fast path: use index
     if (indexEntry) {
+      if (indexEntry.loose && indexEntry.diskPath) {
+        const content = tryReadFileAt(indexEntry.diskPath, cacheKey);
+        if (content) return content;
+      }
+
       const grf = this.grfs[indexEntry.grfIndex];
       if (grf && grf.getFile) {
         const fileContent = await grf.getFile(indexEntry.originalPath);
