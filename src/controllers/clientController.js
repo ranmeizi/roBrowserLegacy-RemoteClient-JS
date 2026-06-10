@@ -5,6 +5,7 @@ const configs = require('../config/configs');
 const LRUCache = require('../utils/LRUCache');
 const logger = require('../utils/logger');
 const iconv = require('iconv-lite');
+const { isLooseFilesMode } = require('../utils/looseFilesMode');
 
 /**
  * Convert mojibake (CP949 bytes interpreted as Latin-1) back to proper Korean Unicode.
@@ -89,6 +90,11 @@ const Client = {
 
     // Check if data section exists and has GRF files configured
     if (!dataIni.data || dataIni.data.length === 0) {
+      if (isLooseFilesMode()) {
+        logger.info('Loose files mode: serving assets from local directories (data/, BGM/, System/)');
+        this.grfs = [];
+        return;
+      }
       logger.warn('No GRF files configured in DATA.INI. Add GRF files to [data] section.');
       this.grfs = [];
       return;
@@ -203,7 +209,22 @@ const Client = {
 
     // Normalize paths
     let grfFilePath = filePath.replace(/\//g, '\\');
-    let localPath = path.join(__dirname, '..', '..', filePath);
+    const projectRoot = path.join(__dirname, '..', '..');
+    let localPath = path.join(projectRoot, filePath);
+
+    // Optional client root for fully unpacked clients outside project tree
+    if (process.env.LOOSE_FILES_ROOT) {
+      const loosePath = path.resolve(projectRoot, process.env.LOOSE_FILES_ROOT, filePath);
+      if (fs.existsSync(loosePath)) {
+        try {
+          const content = fs.readFileSync(loosePath);
+          fileCache.set(cacheKey, content);
+          return content;
+        } catch (e) {
+          logger.error(`Error reading loose root file: ${e.message}`);
+        }
+      }
+    }
 
     // Check local file system first
     if (fs.existsSync(localPath)) {

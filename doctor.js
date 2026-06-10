@@ -68,25 +68,35 @@ async function runDoctor() {
       console.log('   Make sure these exist:');
       console.log('   - resources/');
       console.log('   - resources/DATA.INI');
-      console.log('   - At least one .grf file in resources/');
+      console.log('   - GRF in resources/ OR unpacked data/, BGM/, System/ folders');
       console.log('');
     }
 
     // GRF errors
     if (details.grfs && !details.grfs.valid) {
-      console.log('4️⃣  INCOMPATIBLE GRF FILES:');
-      console.log('   This project only supports GRF version 0x200 with no DES encryption.');
-      console.log('');
-      console.log('   📦 FIX: Repack with GRF Builder');
-      console.log('   ');
-      console.log('   1. Download GRF Builder (https://github.com/Tokeiburu/GRFEditor)');
-      console.log('   2. Open your .grf file in GRF Builder');
-      console.log('   3. Go to: File → Options → Repack type → Decrypt');
-      console.log('   4. Click: Tools → Repack');
-      console.log('   5. Wait for completion and replace the original file');
-      console.log('');
-      console.log('   This will convert it to version 0x200 without DES.');
-      console.log('');
+      if (details.grfs.reason === 'No GRF files in DATA.INI' || details.grfs.reason === 'No loose assets found') {
+        console.log('4️⃣  NO GRF / LOOSE FILES SETUP:');
+        console.log('   For unpacked client files (no GRF):');
+        console.log('   1. Copy client folders into project root: data/, BGM/, System/');
+        console.log('   2. Keep resources/DATA.INI (can have empty [data] section)');
+        console.log('   3. Set USE_LOOSE_FILES=true in .env (optional if folders have content)');
+        console.log('   4. Or set LOOSE_FILES_ROOT=../your-client if assets are elsewhere');
+        console.log('');
+      } else {
+        console.log('4️⃣  INCOMPATIBLE GRF FILES:');
+        console.log('   This project only supports GRF version 0x200 with no DES encryption.');
+        console.log('');
+        console.log('   📦 FIX: Repack with GRF Builder');
+        console.log('   ');
+        console.log('   1. Download GRF Builder (https://github.com/Tokeiburu/GRFEditor)');
+        console.log('   2. Open your .grf file in GRF Builder');
+        console.log('   3. Go to: File → Options → Repack type → Decrypt');
+        console.log('   4. Click: Tools → Repack');
+        console.log('   5. Wait for completion and replace the original file');
+        console.log('');
+        console.log('   This will convert it to version 0x200 without DES.');
+        console.log('');
+      }
     }
 
     console.log('═'.repeat(80));

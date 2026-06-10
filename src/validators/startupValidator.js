@@ -3,6 +3,7 @@ const path = require("path");
 const { execSync } = require("child_process");
 const zlib = require("zlib");
 const { TextDecoder } = require("util");
+const { isLooseFilesMode, hasLooseAssets } = require("../utils/looseFilesMode");
 
 /**
  * Startup validation system
@@ -117,7 +118,32 @@ class StartupValidator {
     const grfFiles = this.parseDataINI(dataIniContent);
 
     if (grfFiles.length === 0) {
-      this.addError("No GRF files found in resources/DATA.INI!");
+      if (isLooseFilesMode()) {
+        if (!hasLooseAssets()) {
+          this.addError(
+            "No GRF files in DATA.INI and no loose assets found in data/, BGM/, System/, or configured override paths"
+          );
+          this.validationResults.grfs = {
+            valid: false,
+            mode: "loose",
+            reason: "No loose assets found",
+          };
+          return false;
+        }
+
+        this.addInfo("Loose files mode: serving assets from local directories (GRF not required)");
+        if (process.env.USE_LOOSE_FILES !== "true") {
+          this.addInfo(
+            "Auto-detected loose files mode (data/, BGM/, or System/ has content). Set USE_LOOSE_FILES=true to skip GRF validation explicitly"
+          );
+        }
+        this.validationResults.grfs = { valid: true, mode: "loose", files: [], count: 0 };
+        return true;
+      }
+
+      this.addError(
+        "No GRF files found in resources/DATA.INI! For unpacked client files, place assets in data/, BGM/, System/ or set USE_LOOSE_FILES=true"
+      );
       this.validationResults.grfs = { valid: false, reason: "No GRF files in DATA.INI" };
       return false;
     }

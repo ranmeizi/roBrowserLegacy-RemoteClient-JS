@@ -11,9 +11,11 @@ module.exports = {
       autorestart: true,
       watch: false,
       max_memory_restart: '1G',
+      // dotenv loads .env from cwd on startup — create .env from .env.example first
       env: {
         NODE_ENV: 'production',
       },
+      env_file: '.env',
       error_file: './logs/pm2-error.log',
       out_file: './logs/pm2-out.log',
       merge_logs: true,
