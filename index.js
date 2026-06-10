@@ -97,12 +97,12 @@ async function startServer() {
   // ESRGAN upscaling middleware - serves upscaled assets from disk cache
   // Plugin: @chicowall/robrowser-esrgan (external package)
   let esrganInstance = null;
-  if (ESRGAN_ENABLED) {
-    const createEsrganMiddleware = require('@chicowall/robrowser-esrgan');
-    const cachePath = path.resolve(__dirname, ESRGAN_CACHE_DIR);
-    esrganInstance = await createEsrganMiddleware({ cacheDir: cachePath, logger });
-    app.use(esrganInstance.middleware);
-  }
+  // if (ESRGAN_ENABLED) {
+  //   const createEsrganMiddleware = require('@chicowall/robrowser-esrgan');
+  //   const cachePath = path.resolve(__dirname, ESRGAN_CACHE_DIR);
+  //   esrganInstance = await createEsrganMiddleware({ cacheDir: cachePath, logger });
+  //   app.use(esrganInstance.middleware);
+  // }
 
   // Validation status endpoint (JSON for frontend)
   app.get('/api/health', (req, res) => {

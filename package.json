@@ -6,6 +6,10 @@
 	"scripts": {
 		"start": "node index.js",
 		"start:prod": "node start-prod.js",
+		"pm2:start": "pm2 start ecosystem.config.js",
+		"pm2:stop": "pm2 stop robrowser-remote-client",
+		"pm2:restart": "pm2 restart robrowser-remote-client",
+		"pm2:logs": "pm2 logs robrowser-remote-client",
 		"prepare": "node prepare.js",
 		"prepare:quick": "node prepare.js --quick",
 		"doctor": "node doctor.js",
