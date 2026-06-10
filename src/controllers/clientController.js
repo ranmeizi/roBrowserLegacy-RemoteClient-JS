@@ -8,10 +8,8 @@ const iconv = require('iconv-lite');
 const { isLooseFilesMode } = require('../utils/looseFilesMode');
 const {
   decodeMojibake,
-  encodeMojibake,
   getFilePathVariants,
   getLooseFilenameEncoding,
-  decodeBufferFilename,
   joinRootWithEncodedPath,
   getKoreanPathVariants,
 } = require('../utils/pathEncoding');
@@ -146,9 +144,10 @@ const Client = {
     // Check if data section exists and has GRF files configured
     if (!dataIni.data || dataIni.data.length === 0) {
       if (isLooseFilesMode()) {
-        logger.info('Loose files mode: serving assets from local directories (data/, BGM/, System/)');
+        logger.info(
+          'Loose files mode: on-demand path lookup with CP949/Unicode aliases (no full data/ index)'
+        );
         this.grfs = [];
-        this.buildLooseFileIndex(path.join(__dirname, '..', '..'));
         return;
       }
       logger.warn('No GRF files configured in DATA.INI. Add GRF files to [data] section.');
@@ -244,89 +243,6 @@ const Client = {
     indexBuilt = true;
     const elapsed = Date.now() - startTime;
     logger.debug(`File index built in ${elapsed}ms`);
-  },
-
-  /**
-   * Index unpacked client files for O(1) lookup (Unicode + mojibake path aliases).
-   */
-  buildLooseFileIndex(projectRoot) {
-    const startTime = Date.now();
-    fileIndex.clear();
-    let fileCount = 0;
-
-    const indexLoosePath = (relPath, diskPath) => {
-      const addKey = (key) => {
-        const normalized = key.toLowerCase().replace(/\\/g, '/');
-        const entry = { loose: true, diskPath, originalPath: relPath };
-        if (!fileIndex.has(normalized)) {
-          fileIndex.set(normalized, entry);
-        }
-        const backslash = key.toLowerCase().replace(/\//g, '\\');
-        if (!fileIndex.has(backslash)) {
-          fileIndex.set(backslash, entry);
-        }
-      };
-
-      addKey(relPath);
-      const mojibakePath = encodeMojibake(relPath);
-      if (mojibakePath !== relPath) {
-        addKey(mojibakePath);
-      }
-    };
-
-    const walkDir = (baseDir, relPrefix, onlySubdirs = null) => {
-      if (onlySubdirs) {
-        for (const sub of onlySubdirs) {
-          walkDir(path.join(baseDir, sub), sub);
-        }
-        return;
-      }
-
-      if (!fs.existsSync(baseDir)) return;
-      const filenameEncoding = getLooseFilenameEncoding();
-      const entries = fs.readdirSync(baseDir, { encoding: 'buffer', withFileTypes: true });
-
-      for (const entry of entries) {
-        const nameBuf = entry.name;
-        const rawName = Buffer.isBuffer(nameBuf) ? nameBuf.toString('latin1') : String(nameBuf);
-        if (rawName.startsWith('add-')) continue;
-
-        const displayName = decodeBufferFilename(nameBuf, filenameEncoding);
-        const full = path.join(baseDir, nameBuf);
-        const rel = relPrefix ? `${relPrefix}/${displayName}` : displayName;
-
-        if (entry.isDirectory()) {
-          walkDir(full, rel);
-        } else if (entry.isFile()) {
-          indexLoosePath(rel.replace(/\\/g, '/'), full);
-          if (displayName !== rawName) {
-            const rawRel = relPrefix ? `${relPrefix}/${rawName}` : rawName;
-            indexLoosePath(rawRel.replace(/\\/g, '/'), full);
-          }
-          fileCount += 1;
-        }
-      }
-    };
-
-    const assetDirs = ['data', 'BGM', 'System'];
-
-    walkDir(projectRoot, null, assetDirs);
-
-    if (process.env.LOOSE_FILES_ROOT) {
-      const looseRoot = path.resolve(projectRoot, process.env.LOOSE_FILES_ROOT);
-      walkDir(looseRoot, null, assetDirs);
-    }
-
-    if (process.env.DATA_OVERRIDE_PATH) {
-      const overrideRoot = path.resolve(projectRoot, process.env.DATA_OVERRIDE_PATH);
-      walkDir(overrideRoot, 'data');
-    }
-
-    indexBuilt = true;
-    const elapsed = Date.now() - startTime;
-    logger.info(
-      `Loose file index: ${fileCount.toLocaleString()} files, ${fileIndex.size.toLocaleString()} lookup keys (${elapsed}ms)`
-    );
   },
 
   /**
