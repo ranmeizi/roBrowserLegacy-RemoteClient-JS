@@ -111,11 +111,19 @@ async function startServer() {
     const cacheStats = Client.getCacheStats ? Client.getCacheStats() : null;
     const indexStats = Client.getIndexStats ? Client.getIndexStats() : null;
 
+    let resolverVersion = null;
+    try {
+      resolverVersion = require('./src/utils/pathEncoding').LOOSE_PATH_RESOLVER_VERSION;
+    } catch {
+      // ignore
+    }
+
     res.json({
       ...validationStatus,
       missingFiles: missingInfo,
       cache: cacheStats,
       index: indexStats,
+      loosePathResolverVersion: resolverVersion,
       esrgan: esrganInstance ? esrganInstance.getStats() : { enabled: false },
     });
   });
@@ -134,6 +142,16 @@ async function startServer() {
       cache: Client.getCacheStats ? Client.getCacheStats() : null,
       index: Client.getIndexStats ? Client.getIndexStats() : null,
     });
+  });
+
+  // Path encoding diagnostics (loose files / CP949 folder names)
+  app.get('/api/debug/path', (req, res) => {
+    const Client = require('./src/controllers/clientController');
+    const filePath = req.query.path || 'data/texture/내부소품/alde-incol.bmp';
+    if (!Client.diagnosePath) {
+      return res.status(501).json({ error: 'diagnosePath not available — sync latest RemoteClient-JS src/' });
+    }
+    res.json(Client.diagnosePath(filePath));
   });
 
   // Serve roBrowserLegacy static files (replaces live-server)

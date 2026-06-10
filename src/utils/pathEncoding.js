@@ -116,6 +116,15 @@ function getSegmentMatchKeys(segment) {
     if (mojibake !== segment) {
       add(mojibake);
     }
+
+    // CP949 bytes shown as Chinese in GBK terminals (aidlux default): 내부소품 → 郴何家前
+    try {
+      const cp949Buf = iconv.encode(segment, 'cp949');
+      add(iconv.decode(cp949Buf, 'gbk'));
+      add(iconv.decode(cp949Buf, 'gb18030'));
+    } catch {
+      // ignore
+    }
   }
 
   try {
@@ -137,6 +146,13 @@ function getEntryMatchKeys(nameBuf, filenameEncoding) {
 
   add(nameBuf.toString('latin1'));
   add(decodeBufferFilename(nameBuf, filenameEncoding));
+
+  try {
+    add(iconv.decode(nameBuf, 'gbk'));
+    add(iconv.decode(nameBuf, 'gb18030'));
+  } catch {
+    // ignore
+  }
 
   try {
     add(nameBuf.toString('utf8'));
@@ -176,10 +192,42 @@ function bytesMatchSegment(nameBuf, segment, filenameEncoding) {
   return false;
 }
 
+function getBufferEntryType(parentBuf, nameBuf) {
+  const fullPath = Buffer.concat([parentBuf, Buffer.from([0x2f]), nameBuf]);
+  try {
+    const stat = fs.statSync(fullPath);
+    if (stat.isDirectory()) {
+      return 'dir';
+    }
+    if (stat.isFile()) {
+      return 'file';
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function describeBufferName(nameBuf, filenameEncoding) {
+  return {
+    latin1: nameBuf.toString('latin1'),
+    utf8: nameBuf.toString('utf8'),
+    decoded: decodeBufferFilename(nameBuf, filenameEncoding),
+    hex: [...nameBuf].map(b => b.toString(16).padStart(2, '0')).join(' '),
+  };
+}
+
 /**
  * Walk unpacked client directories and match each segment by Unicode / mojibake / CP949 bytes.
+ * Returns { path: Buffer } or { failedAt, segment, entries } when diagnose=true.
  */
-function resolveLooseFilePath(projectRoot, filePath, filenameEncoding = 'cp949', stripDataPrefix = false) {
+function resolveLooseFilePath(
+  projectRoot,
+  filePath,
+  filenameEncoding = 'cp949',
+  stripDataPrefix = false,
+  diagnose = false
+) {
   let rel = filePath.replace(/\\/g, '/');
   if (stripDataPrefix) {
     rel = rel.replace(/^data[\/\\]/i, '');
@@ -212,10 +260,11 @@ function resolveLooseFilePath(projectRoot, filePath, filenameEncoding = 'cp949',
         continue;
       }
 
-      if (isFile && !entry.isFile()) {
+      const entryType = getBufferEntryType(dirBuf, nameBuf);
+      if (isFile && entryType !== 'file') {
         continue;
       }
-      if (!isFile && !entry.isDirectory()) {
+      if (!isFile && entryType !== 'dir') {
         continue;
       }
 
@@ -227,13 +276,86 @@ function resolveLooseFilePath(projectRoot, filePath, filenameEncoding = 'cp949',
     }
 
     if (!matchedName) {
-      return null;
+      if (!diagnose) {
+        return null;
+      }
+
+      const sample = entries.slice(0, 40).map(entry => {
+        const nameBuf = Buffer.isBuffer(entry.name) ? entry.name : Buffer.from(String(entry.name));
+        return describeBufferName(nameBuf, filenameEncoding);
+      });
+
+      return {
+        ok: false,
+        failedAt: i,
+        segment: targetSeg,
+        segmentKeys: [...targetKeys],
+        parent: dirBuf.toString('utf8'),
+        entriesTotal: entries.length,
+        entriesSample: sample,
+      };
     }
 
     dirBuf = Buffer.concat([dirBuf, Buffer.from([0x2f]), matchedName]);
   }
 
+  if (diagnose) {
+    return { ok: true, path: dirBuf.toString('latin1'), exists: fs.existsSync(dirBuf) };
+  }
+
   return dirBuf;
+}
+
+/**
+ * Find a loose file by basename under a subtree (debug / path-mapping discovery).
+ */
+function findLooseFileByName(projectRoot, basename, under = 'data', maxResults = 10, maxDepth = 8) {
+  const results = [];
+  const target = basename.toLowerCase();
+  const filenameEncoding = getLooseFilenameEncoding();
+  const startPath = path.join(projectRoot, under);
+
+  const walk = (dirBuf, relParts, depth) => {
+    if (depth > maxDepth || results.length >= maxResults) {
+      return;
+    }
+
+    let entries;
+    try {
+      entries = fs.readdirSync(dirBuf, { encoding: 'buffer', withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const nameBuf = Buffer.isBuffer(entry.name) ? entry.name : Buffer.from(String(entry.name));
+      const rawLatin = nameBuf.toString('latin1');
+      if (rawLatin.startsWith('add-')) {
+        continue;
+      }
+
+      const fullBuf = Buffer.concat([dirBuf, Buffer.from([0x2f]), nameBuf]);
+      const entryType = getBufferEntryType(dirBuf, nameBuf);
+      const relPath = [...relParts, rawLatin].join('/');
+
+      if (entryType === 'file' && rawLatin.toLowerCase() === target) {
+        results.push({
+          relPath,
+          ...describeBufferName(nameBuf, filenameEncoding),
+        });
+      }
+
+      if (entryType === 'dir') {
+        walk(fullBuf, [...relParts, rawLatin], depth + 1);
+      }
+    }
+  };
+
+  if (fs.existsSync(startPath)) {
+    walk(Buffer.from(startPath), [under.replace(/\\/g, '/')], 0);
+  }
+
+  return results;
 }
 
 /**
@@ -326,12 +448,14 @@ function getFilePathVariants(filePath, pathMapping) {
 }
 
 module.exports = {
+  LOOSE_PATH_RESOLVER_VERSION: 3,
   getLooseFilenameEncoding,
   decodeBufferFilename,
   decodeFilesystemName,
   joinRootWithEncodedPath,
   joinRootWithLatin1Path,
   resolveLooseFilePath,
+  findLooseFileByName,
   getKoreanPathVariants,
   decodeMojibake,
   encodeMojibake,

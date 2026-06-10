@@ -7,12 +7,15 @@ const logger = require('../utils/logger');
 const iconv = require('iconv-lite');
 const { isLooseFilesMode } = require('../utils/looseFilesMode');
 const {
+  LOOSE_PATH_RESOLVER_VERSION,
   decodeMojibake,
+  encodeMojibake,
   getFilePathVariants,
   getLooseFilenameEncoding,
   joinRootWithEncodedPath,
   joinRootWithLatin1Path,
   resolveLooseFilePath,
+  findLooseFileByName,
   getKoreanPathVariants,
 } = require('../utils/pathEncoding');
 
@@ -564,7 +567,36 @@ const Client = {
     const elapsed = Date.now() - startTime;
     logger.info(`Cache warmed with ${warmed} files in ${elapsed}ms`);
     return warmed;
-  }
+  },
+
+  diagnosePath(filePath) {
+    const projectRoot = path.join(__dirname, '..', '..');
+    const filenameEncoding = getLooseFilenameEncoding();
+    const basename = path.basename(filePath.replace(/\\/g, '/'));
+    const resolved = resolveLooseFilePath(projectRoot, filePath, filenameEncoding, false, true);
+    const found = findLooseFileByName(projectRoot, basename, 'data', 5);
+
+    const folderSeg = filePath.replace(/\\/g, '/').split('/').slice(-2, -1)[0] || '';
+    let expectedGbkFolder = null;
+    if (folderSeg && /[가-힣]/.test(folderSeg)) {
+      try {
+        expectedGbkFolder = iconv.decode(iconv.encode(folderSeg, 'cp949'), 'gbk');
+      } catch {
+        // ignore
+      }
+    }
+
+    return {
+      resolverVersion: LOOSE_PATH_RESOLVER_VERSION,
+      projectRoot,
+      filenameEncoding,
+      requestedPath: filePath,
+      expectedMojibakeFolder: folderSeg ? encodeMojibake(folderSeg) : null,
+      expectedGbkTerminalFolder: expectedGbkFolder,
+      resolve: resolved,
+      findByName: found,
+    };
+  },
 };
 
 function parseIni(data) {
