@@ -10,6 +10,10 @@ const {
   decodeMojibake,
   encodeMojibake,
   getFilePathVariants,
+  getLooseFilenameEncoding,
+  decodeBufferFilename,
+  joinRootWithEncodedPath,
+  getKoreanPathVariants,
 } = require('../utils/pathEncoding');
 
 function tryReadFileAt(fullPath, cacheKey) {
@@ -28,7 +32,9 @@ function tryReadFileAt(fullPath, cacheKey) {
  * Resolve loose (unpacked) client files, including mojibake Korean path variants.
  */
 function tryReadLooseFile(projectRoot, filePath, cacheKey) {
+  const filenameEncoding = getLooseFilenameEncoding();
   const variants = getFilePathVariants(filePath, pathMapping);
+  const koreanVariants = getKoreanPathVariants(filePath, pathMapping);
   const roots = [{ base: projectRoot, stripDataPrefix: false }];
 
   if (process.env.LOOSE_FILES_ROOT) {
@@ -43,6 +49,17 @@ function tryReadLooseFile(projectRoot, filePath, cacheKey) {
       base: path.resolve(projectRoot, process.env.DATA_OVERRIDE_PATH),
       stripDataPrefix: true,
     });
+  }
+
+  // CP949 byte paths (Korean Windows client copied to Linux — names are not UTF-8)
+  if (filenameEncoding !== 'utf-8' && filenameEncoding !== 'utf8') {
+    for (const variant of koreanVariants) {
+      for (const { base, stripDataPrefix } of roots) {
+        const bufPath = joinRootWithEncodedPath(base, variant, filenameEncoding, stripDataPrefix);
+        const content = tryReadFileAt(bufPath, cacheKey);
+        if (content) return content;
+      }
+    }
   }
 
   for (const variant of variants) {
@@ -266,14 +283,26 @@ const Client = {
       }
 
       if (!fs.existsSync(baseDir)) return;
-      for (const entry of fs.readdirSync(baseDir, { withFileTypes: true })) {
-        if (entry.name.startsWith('add-')) continue;
-        const full = path.join(baseDir, entry.name);
-        const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+      const filenameEncoding = getLooseFilenameEncoding();
+      const entries = fs.readdirSync(baseDir, { encoding: 'buffer', withFileTypes: true });
+
+      for (const entry of entries) {
+        const nameBuf = entry.name;
+        const rawName = Buffer.isBuffer(nameBuf) ? nameBuf.toString('latin1') : String(nameBuf);
+        if (rawName.startsWith('add-')) continue;
+
+        const displayName = decodeBufferFilename(nameBuf, filenameEncoding);
+        const full = path.join(baseDir, nameBuf);
+        const rel = relPrefix ? `${relPrefix}/${displayName}` : displayName;
+
         if (entry.isDirectory()) {
           walkDir(full, rel);
         } else if (entry.isFile()) {
           indexLoosePath(rel.replace(/\\/g, '/'), full);
+          if (displayName !== rawName) {
+            const rawRel = relPrefix ? `${relPrefix}/${rawName}` : rawName;
+            indexLoosePath(rawRel.replace(/\\/g, '/'), full);
+          }
           fileCount += 1;
         }
       }
