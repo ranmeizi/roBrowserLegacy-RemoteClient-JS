@@ -1,3 +1,4 @@
+const fs = require('fs');
 const path = require('path');
 const iconv = require('iconv-lite');
 
@@ -68,6 +69,171 @@ function joinRootWithEncodedPath(rootDir, relativePath, filenameEncoding, stripD
     chunks.push(iconv.encode(seg, filenameEncoding));
   }
   return Buffer.concat(chunks);
+}
+
+/**
+ * Build a filesystem path using Latin-1 bytes per segment (GRF mojibake on disk).
+ * path.join() would UTF-8-encode U+00B3-style chars and break CP949 directory names.
+ */
+function joinRootWithLatin1Path(rootDir, relativePath, stripDataPrefix = false) {
+  let rel = relativePath.replace(/\\/g, '/');
+  if (stripDataPrefix) {
+    rel = rel.replace(/^data[\/\\]/i, '');
+  }
+
+  const segments = rel.split('/').filter(Boolean);
+  const chunks = [Buffer.from(rootDir)];
+  for (const seg of segments) {
+    chunks.push(Buffer.from([0x2f]));
+    chunks.push(Buffer.from(seg, 'latin1'));
+  }
+  return Buffer.concat(chunks);
+}
+
+function normalizeSegmentKey(segment) {
+  return segment.toLowerCase();
+}
+
+function getSegmentMatchKeys(segment) {
+  const keys = new Set();
+  const add = (value) => {
+    if (value) {
+      keys.add(normalizeSegmentKey(value));
+    }
+  };
+
+  add(segment);
+
+  if (/[\u0080-\u00ff]/.test(segment)) {
+    const decoded = decodeMojibake(segment);
+    if (decoded !== segment) {
+      add(decoded);
+    }
+  }
+
+  if (/[가-힣]/.test(segment)) {
+    const mojibake = encodeMojibake(segment);
+    if (mojibake !== segment) {
+      add(mojibake);
+    }
+  }
+
+  try {
+    add(Buffer.from(segment, 'utf8').toString('latin1'));
+  } catch {
+    // ignore
+  }
+
+  return keys;
+}
+
+function getEntryMatchKeys(nameBuf, filenameEncoding) {
+  const keys = new Set();
+  const add = (value) => {
+    if (value) {
+      keys.add(normalizeSegmentKey(value));
+    }
+  };
+
+  add(nameBuf.toString('latin1'));
+  add(decodeBufferFilename(nameBuf, filenameEncoding));
+
+  try {
+    add(nameBuf.toString('utf8'));
+  } catch {
+    // ignore
+  }
+
+  return keys;
+}
+
+function segmentsShareKeys(targetKeys, entryKeys) {
+  for (const key of targetKeys) {
+    if (entryKeys.has(key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function bytesMatchSegment(nameBuf, segment, filenameEncoding) {
+  const variants = [segment];
+  const decoded = decodeMojibake(segment);
+  if (decoded !== segment) {
+    variants.push(decoded);
+  }
+
+  for (const variant of variants) {
+    try {
+      if (nameBuf.equals(iconv.encode(variant, filenameEncoding))) {
+        return true;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Walk unpacked client directories and match each segment by Unicode / mojibake / CP949 bytes.
+ */
+function resolveLooseFilePath(projectRoot, filePath, filenameEncoding = 'cp949', stripDataPrefix = false) {
+  let rel = filePath.replace(/\\/g, '/');
+  if (stripDataPrefix) {
+    rel = rel.replace(/^data[\/\\]/i, '');
+  }
+
+  const parts = rel.split('/').filter(Boolean);
+  if (!parts.length) {
+    return null;
+  }
+
+  let dirBuf = Buffer.from(projectRoot);
+
+  for (let i = 0; i < parts.length; i++) {
+    const targetSeg = parts[i];
+    const isFile = i === parts.length - 1;
+    const targetKeys = getSegmentMatchKeys(targetSeg);
+
+    let entries;
+    try {
+      entries = fs.readdirSync(dirBuf, { encoding: 'buffer', withFileTypes: true });
+    } catch {
+      return null;
+    }
+
+    let matchedName = null;
+    for (const entry of entries) {
+      const nameBuf = Buffer.isBuffer(entry.name) ? entry.name : Buffer.from(String(entry.name));
+      const rawLatin = nameBuf.toString('latin1');
+      if (rawLatin.startsWith('add-')) {
+        continue;
+      }
+
+      if (isFile && !entry.isFile()) {
+        continue;
+      }
+      if (!isFile && !entry.isDirectory()) {
+        continue;
+      }
+
+      const entryKeys = getEntryMatchKeys(nameBuf, filenameEncoding);
+      if (segmentsShareKeys(targetKeys, entryKeys) || bytesMatchSegment(nameBuf, targetSeg, filenameEncoding)) {
+        matchedName = nameBuf;
+        break;
+      }
+    }
+
+    if (!matchedName) {
+      return null;
+    }
+
+    dirBuf = Buffer.concat([dirBuf, Buffer.from([0x2f]), matchedName]);
+  }
+
+  return dirBuf;
 }
 
 /**
@@ -164,6 +330,8 @@ module.exports = {
   decodeBufferFilename,
   decodeFilesystemName,
   joinRootWithEncodedPath,
+  joinRootWithLatin1Path,
+  resolveLooseFilePath,
   getKoreanPathVariants,
   decodeMojibake,
   encodeMojibake,

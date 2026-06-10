@@ -11,6 +11,8 @@ const {
   getFilePathVariants,
   getLooseFilenameEncoding,
   joinRootWithEncodedPath,
+  joinRootWithLatin1Path,
+  resolveLooseFilePath,
   getKoreanPathVariants,
 } = require('../utils/pathEncoding');
 
@@ -49,13 +51,26 @@ function tryReadLooseFile(projectRoot, filePath, cacheKey) {
     });
   }
 
+  // Walk directories: match Unicode HTTP URLs to CP949 / mojibake on-disk names
+  for (const { base, stripDataPrefix } of roots) {
+    const resolved = resolveLooseFilePath(base, filePath, filenameEncoding, stripDataPrefix);
+    if (resolved) {
+      const content = tryReadFileAt(resolved, cacheKey);
+      if (content) {
+        return content;
+      }
+    }
+  }
+
   // CP949 byte paths (Korean Windows client copied to Linux — names are not UTF-8)
   if (filenameEncoding !== 'utf-8' && filenameEncoding !== 'utf8') {
     for (const variant of koreanVariants) {
       for (const { base, stripDataPrefix } of roots) {
         const bufPath = joinRootWithEncodedPath(base, variant, filenameEncoding, stripDataPrefix);
         const content = tryReadFileAt(bufPath, cacheKey);
-        if (content) return content;
+        if (content) {
+          return content;
+        }
       }
     }
   }
@@ -66,8 +81,19 @@ function tryReadLooseFile(projectRoot, filePath, cacheKey) {
       if (stripDataPrefix) {
         rel = rel.replace(/^data[\/\\]/i, '');
       }
+
+      if (/[\u0080-\u00ff]/.test(rel) && !/[가-힣]/.test(rel)) {
+        const latinPath = joinRootWithLatin1Path(base, rel, stripDataPrefix);
+        const latinContent = tryReadFileAt(latinPath, cacheKey);
+        if (latinContent) {
+          return latinContent;
+        }
+      }
+
       const content = tryReadFileAt(path.join(base, rel), cacheKey);
-      if (content) return content;
+      if (content) {
+        return content;
+      }
     }
   }
 
