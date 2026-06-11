@@ -18,6 +18,7 @@ const {
   getFilePathVariants,
   getLooseFilenameEncoding,
   joinRootWithEncodedPath,
+  joinRootWithGbkUtf8Path,
   joinRootWithLatin1Path,
   resolveLooseFilePath,
   findLooseFileByName,
@@ -122,6 +123,13 @@ function tryReadLooseFile(projectRoot, filePath, cacheKey) {
       const content = tryDiskPath(bufPath);
       if (content) {
         return content;
+      }
+
+      // Shell-created dirs: UTF-8 蜡历牢磐其捞胶 instead of CP949 유저인터페이스 bytes
+      const utf8GbkPath = joinRootWithGbkUtf8Path(base, filePath, stripDataPrefix);
+      const utf8Content = tryDiskPath(utf8GbkPath);
+      if (utf8Content) {
+        return utf8Content;
       }
     }
   }

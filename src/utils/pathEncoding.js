@@ -113,6 +113,33 @@ function joinRootWithEncodedPath(rootDir, relativePath, filenameEncoding, stripD
 }
 
 /**
+ * Build path using UTF-8 bytes of GBK-terminal folder names (shell-created dirs on aidlux).
+ * e.g. 유저인터페이스 → 蜡历牢磐其捞胶 as UTF-8 folder on disk.
+ */
+function joinRootWithGbkUtf8Path(rootDir, relativePath, stripDataPrefix = false) {
+  let rel = relativePath.replace(/\\/g, '/');
+  if (stripDataPrefix) {
+    rel = rel.replace(/^data[\/\\]/i, '');
+  }
+
+  const segments = rel.split('/').filter(Boolean);
+  const chunks = [Buffer.from(rootDir)];
+  for (const seg of segments) {
+    chunks.push(Buffer.from([0x2f]));
+    if (/[가-힣]/.test(seg)) {
+      try {
+        chunks.push(Buffer.from(iconv.decode(iconv.encode(seg, 'cp949'), 'gbk'), 'utf8'));
+        continue;
+      } catch {
+        // fall through
+      }
+    }
+    chunks.push(Buffer.from(seg, 'utf8'));
+  }
+  return Buffer.concat(chunks);
+}
+
+/**
  * Build a filesystem path using Latin-1 bytes per segment (GRF mojibake on disk).
  * path.join() would UTF-8-encode U+00B3-style chars and break CP949 directory names.
  */
@@ -330,10 +357,16 @@ function resolveLooseFilePath(
       }
     }
 
-    if (segmentResolveCache.size >= SEGMENT_CACHE_MAX) {
-      segmentResolveCache.clear();
+    if (matchedName) {
+      if (segmentResolveCache.size >= SEGMENT_CACHE_MAX) {
+        segmentResolveCache.clear();
+      }
+      segmentResolveCache.set(segmentCacheKey, matchedName);
+    } else {
+      // Do not cache misses — dirs/files may be added after first 404 (e.g. select_character).
+      segmentResolveCache.delete(segmentCacheKey);
+      dirListingCache.delete(dirCacheKey(dirBuf));
     }
-    segmentResolveCache.set(segmentCacheKey, matchedName);
 
     if (!matchedName) {
       if (!diagnose) {
@@ -508,12 +541,13 @@ function getFilePathVariants(filePath, pathMapping) {
 }
 
 module.exports = {
-  LOOSE_PATH_RESOLVER_VERSION: 4,
+  LOOSE_PATH_RESOLVER_VERSION: 5,
   getLooseFilenameEncoding,
   decodeBufferFilename,
   decodeFilesystemName,
   readDirCached,
   joinRootWithEncodedPath,
+  joinRootWithGbkUtf8Path,
   joinRootWithLatin1Path,
   resolveLooseFilePath,
   findLooseFileByName,
